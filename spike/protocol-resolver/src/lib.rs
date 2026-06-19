@@ -32,12 +32,22 @@ const VALID_EXTENSIONS: &[&str] = &[
     "svg", "png", "jpg", "jpeg", "gif", "bmp", "webp", "mp4", "otf", "ttf",
 ];
 
+/// Relative resource paths of the workbench entry document. The window loads
+/// `workbench.html` when built, `workbench-dev.html` from sources. See
+/// `windowImpl.ts` (`FileAccess.asBrowserUri('vs/code/.../workbench{,-dev}.html')`).
+pub const WORKBENCH_HTML: &str = "vs/code/electron-browser/workbench/workbench.html";
+pub const WORKBENCH_DEV_HTML: &str = "vs/code/electron-browser/workbench/workbench-dev.html";
+
 /// The outcome of a protocol request, matching Electron's two callback shapes:
-/// serve a file (with a Content-Type) or abort.
+/// serve a file (with a Content-Type + headers) or abort.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
-    /// Serve this on-disk path with the given MIME type.
-    Allow { path: PathBuf, mime: String },
+    /// Serve this on-disk path with the given MIME type and response headers.
+    Allow {
+        path: PathBuf,
+        mime: String,
+        headers: Vec<(String, String)>,
+    },
     /// Refuse the request (Electron `-3` ABORTED).
     Block,
 }
@@ -45,6 +55,12 @@ pub enum Resolution {
 pub struct ResourceResolver {
     valid_roots: Vec<PathBuf>,
     valid_extensions: HashSet<String>,
+    /// Whether the renderer runs cross-origin-isolated. When true the workbench
+    /// document gets COOP+COEP. Mirrors `environmentService.crossOriginIsolated`.
+    cross_origin_isolated: bool,
+    /// `false` when running from sources: adds `Cache-Control: no-cache,no-store`
+    /// (protocolMainService evicts the renderer memory cache in OSS dev).
+    is_built: bool,
 }
 
 impl ResourceResolver {
@@ -52,7 +68,19 @@ impl ResourceResolver {
         ResourceResolver {
             valid_roots: Vec::new(),
             valid_extensions: VALID_EXTENSIONS.iter().map(|s| s.to_string()).collect(),
+            cross_origin_isolated: false,
+            is_built: true,
         }
+    }
+
+    pub fn with_cross_origin_isolated(mut self, value: bool) -> Self {
+        self.cross_origin_isolated = value;
+        self
+    }
+
+    pub fn with_built(mut self, value: bool) -> Self {
+        self.is_built = value;
+        self
     }
 
     /// Register a directory whose descendants may be served. Mirrors
@@ -84,11 +112,102 @@ impl ResourceResolver {
             let mime = mime_guess::from_path(&path)
                 .first_or_octet_stream()
                 .to_string();
-            Resolution::Allow { path, mime }
+            let headers = self.headers_for(&path, request_url);
+            Resolution::Allow { path, mime, headers }
         } else {
             Resolution::Block
         }
     }
+
+    /// Response headers for an allowed resource, mirroring the accumulation in
+    /// `protocolMainService.handleResourceRequest`:
+    /// 1. if cross-origin-isolated: COOP+COEP for the workbench document, else
+    ///    whatever the `vscode-coi` query param requests;
+    /// 2. if not built: `Cache-Control: no-cache, no-store`;
+    /// 3. always: `Document-Policy` on the workbench document.
+    fn headers_for(&self, path: &Path, request_url: &str) -> Vec<(String, String)> {
+        let mut headers: Vec<(String, String)> = Vec::new();
+        let is_workbench = is_workbench_document(path);
+
+        if self.cross_origin_isolated {
+            if is_workbench {
+                push_coop_coep(&mut headers);
+            } else {
+                push_coi_from_query(&mut headers, request_url);
+            }
+        }
+
+        if !self.is_built {
+            headers.push(("Cache-Control".into(), "no-cache, no-store".into()));
+        }
+
+        if is_workbench {
+            headers.push((
+                "Document-Policy".into(),
+                "include-js-call-stacks-in-crash-reports".into(),
+            ));
+        }
+
+        headers
+    }
+}
+
+fn is_workbench_document(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("workbench.html") | Some("workbench-dev.html")
+    )
+}
+
+fn push_coop_coep(headers: &mut Vec<(String, String)>) {
+    headers.push(("Cross-Origin-Opener-Policy".into(), "same-origin".into()));
+    headers.push(("Cross-Origin-Embedder-Policy".into(), "require-corp".into()));
+}
+
+/// `COI.getHeadersFromQuery`: the `vscode-coi` param selects 1=COOP, 2=COEP, 3=both.
+fn push_coi_from_query(headers: &mut Vec<(String, String)>, request_url: &str) {
+    let value = Url::parse(request_url)
+        .ok()
+        .and_then(|u| u.query_pairs().find(|(k, _)| k == "vscode-coi").map(|(_, v)| v.into_owned()));
+    match value.as_deref() {
+        Some("1") => headers.push(("Cross-Origin-Opener-Policy".into(), "same-origin".into())),
+        Some("2") => headers.push(("Cross-Origin-Embedder-Policy".into(), "require-corp".into())),
+        Some("3") => push_coop_coep(headers),
+        _ => {}
+    }
+}
+
+/// `FileAccess.asBrowserUri`: turn an absolute file path into the
+/// `vscode-file://vscode-app/...` URL the renderer loads. Inverse of
+/// `uri_to_file_path`.
+pub fn file_path_to_uri(path: &Path) -> String {
+    // Percent-encode each path segment but keep the `/` separators.
+    const SEG: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
+    let normalized = lexically_normalize(path);
+    let mut encoded = String::new();
+    for comp in normalized.components() {
+        if let Component::Normal(seg) = comp {
+            encoded.push('/');
+            encoded.push_str(
+                &percent_encoding::utf8_percent_encode(&seg.to_string_lossy(), SEG).to_string(),
+            );
+        }
+    }
+    if encoded.is_empty() {
+        encoded.push('/');
+    }
+    format!("{}://{}{}", SCHEME, FALLBACK_AUTHORITY, encoded)
+}
+
+/// The `vscode-file://` URL of the workbench document to load, given the app
+/// root that contains the `vs/` bundle. Mirrors the `windowImpl.ts` `loadURL`.
+pub fn workbench_url(app_root: &Path, is_built: bool) -> String {
+    let rel = if is_built { WORKBENCH_HTML } else { WORKBENCH_DEV_HTML };
+    file_path_to_uri(&app_root.join(rel))
 }
 
 /// True if `path` is `root` itself or lives beneath it. Comparison is on
@@ -190,6 +309,7 @@ mod tests {
             Resolution::Allow {
                 path: PathBuf::from("/opt/app/out/vs/workbench.js"),
                 mime: "text/javascript".to_string(),
+                headers: vec![],
             }
         );
     }
@@ -222,6 +342,7 @@ mod tests {
             Resolution::Allow {
                 path: PathBuf::from("/home/user/pictures/photo.png"),
                 mime: "image/png".to_string(),
+                headers: vec![],
             }
         );
     }
@@ -239,6 +360,89 @@ mod tests {
     fn blocks_wrong_scheme() {
         let r = resolver_with_root("/opt/app/out");
         assert_eq!(r.resolve("file:///opt/app/out/vs/workbench.js"), Resolution::Block);
+    }
+
+    // --- Phase 1: booting the workbench window ---
+
+    fn headers_of(res: &Resolution) -> Vec<(String, String)> {
+        match res {
+            Resolution::Allow { headers, .. } => headers.clone(),
+            Resolution::Block => panic!("expected Allow, got Block"),
+        }
+    }
+    fn has_header(res: &Resolution, k: &str, v: &str) -> bool {
+        headers_of(res).iter().any(|(hk, hv)| hk == k && hv == v)
+    }
+
+    #[test]
+    fn workbench_url_points_at_built_html() {
+        let url = workbench_url(Path::new("/opt/app/out"), true);
+        assert_eq!(
+            url,
+            "vscode-file://vscode-app/opt/app/out/vs/code/electron-browser/workbench/workbench.html"
+        );
+    }
+
+    #[test]
+    fn workbench_url_uses_dev_html_from_sources() {
+        let url = workbench_url(Path::new("/opt/app/out"), false);
+        assert!(url.ends_with("/workbench-dev.html"), "got {url}");
+    }
+
+    #[test]
+    fn browser_uri_roundtrips_with_file_path() {
+        // asBrowserUri then uriToFileUri must return the original path,
+        // including paths that need percent-encoding.
+        let original = PathBuf::from("/opt/my app/vs/loader.js");
+        let url = file_path_to_uri(&original);
+        assert_eq!(uri_to_file_path(&url), Some(original));
+    }
+
+    #[test]
+    fn workbench_html_always_gets_document_policy() {
+        // Unconditional in protocolMainService, even when built and not COI.
+        let r = resolver_with_root("/opt/app/out");
+        let res = r.resolve(&workbench_url(Path::new("/opt/app/out"), true));
+        assert!(has_header(
+            &res,
+            "Document-Policy",
+            "include-js-call-stacks-in-crash-reports"
+        ));
+    }
+
+    #[test]
+    fn workbench_html_gets_coop_coep_when_cross_origin_isolated() {
+        let mut r = ResourceResolver::new().with_cross_origin_isolated(true);
+        r.add_valid_root("/opt/app/out");
+        let res = r.resolve(&workbench_url(Path::new("/opt/app/out"), true));
+        assert!(has_header(&res, "Cross-Origin-Opener-Policy", "same-origin"));
+        assert!(has_header(&res, "Cross-Origin-Embedder-Policy", "require-corp"));
+    }
+
+    #[test]
+    fn non_workbench_gets_no_coi_without_query_even_when_isolated() {
+        let mut r = ResourceResolver::new().with_cross_origin_isolated(true);
+        r.add_valid_root("/opt/app/out");
+        let res = r.resolve("vscode-file://vscode-app/opt/app/out/vs/main.js");
+        assert!(headers_of(&res).is_empty());
+    }
+
+    #[test]
+    fn non_workbench_honors_vscode_coi_query() {
+        let mut r = ResourceResolver::new().with_cross_origin_isolated(true);
+        r.add_valid_root("/opt/app/out");
+        let res = r.resolve("vscode-file://vscode-app/opt/app/out/w.js?vscode-coi=3");
+        assert!(has_header(&res, "Cross-Origin-Opener-Policy", "same-origin"));
+        assert!(has_header(&res, "Cross-Origin-Embedder-Policy", "require-corp"));
+    }
+
+    #[test]
+    fn unbuilt_adds_no_cache() {
+        let r = ResourceResolver::new().with_built(false);
+        let mut r = r;
+        r.add_valid_root("/opt/app/out");
+        let res = r.resolve("vscode-file://vscode-app/opt/app/out/vs/main.js");
+        assert!(has_header(&res, "Cache-Control", "no-cache, no-store"));
     }
 
     #[test]

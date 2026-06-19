@@ -124,7 +124,7 @@ Risk: 🟢 direct equivalent · 🟡 needs glue · 🔴 hard / partial.
 | `protocol.registerFileProtocol('vscode-file')` | `protocol`, `webview/webviewProtocolProvider` | **Ported in spike** → `register_uri_scheme_protocol` + `vscode-protocol-resolver` | 🟢 ✔ |
 | `protocol.interceptFileProtocol('file')` block | `protocolMainService` | resolver returns `Block` for non-`vscode-file` | 🟢 ✔ |
 | `net` (HTTP) | `request/electron-utility` | `reqwest` crate | 🟢 |
-| `session` config (COOP/COEP, headers) | `app.ts`, `protocol` | Headers set in `uri_scheme` response (resolver already returns COI-capable headers point) | 🟡 |
+| `session` config (COOP/COEP, headers) | `app.ts`, `protocol` | **Ported (Phase 1)** → resolver returns COOP/COEP, `vscode-coi` query headers, Cache-Control and Document-Policy in the `uri_scheme` response | 🟢 ✔ |
 | disk FS provider | `files/electron-main` | Stays Node in sidecar; Rust `std::fs`/`notify` if moved | 🟡 |
 
 ### 3f. Child processes (the Node sidecar)
@@ -142,10 +142,14 @@ Risk: 🟢 direct equivalent · 🟡 needs glue · 🔴 hard / partial.
 - **Phase 0 — Spike (this PR).** Prove Monaco renders in the native webview;
   port the `vscode-file://` security handler to Rust with TDD. Establish the
   benchmark harness. ✔
-- **Phase 1 — Boot a window.** Rust main opens one `WebviewWindow` loading
-  `workbench.html` via the ported protocol. No IPC yet → workbench will error on
-  first `ipcRenderer` call; that's the Phase-2 boundary. Benchmark cold start vs
-  Electron here.
+- **Phase 1 — Boot a window. ✔ (this PR)** Rust main computes the workbench
+  `vscode-file://` URL (ported `FileAccess.asBrowserUri` + the `windowImpl`
+  `loadURL` choice of `workbench{,-dev}.html`) and opens one `WebviewWindow` at
+  it, serving assets through the resolver — now including the
+  COOP/COEP/Cache-Control/Document-Policy headers from
+  `protocolMainService.handleResourceRequest`. No IPC yet → workbench will error
+  on first `ipcRenderer` call; that's the Phase-2 boundary. Benchmark cold start
+  vs Electron here.
 - **Phase 2 — IPC transport swap.** Implement Tauri transport behind
   `IPCServer`/`IChannel`; bring up the small set of services the workbench needs
   to reach "empty window" (host, lifecycle, storage, log).

@@ -9,6 +9,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+url = "2"
 # The TDD-tested security/asset logic lives in its own crate so it stays
 # headlessly testable (no webkit). Here we just wire it into the webview.
 vscode-protocol-resolver = { path = "../protocol-resolver" }

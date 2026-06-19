@@ -1,60 +1,94 @@
-//! Tauri shell for the VS Code → Tauri spike.
+//! Tauri shell for the VS Code → Tauri port.
 //!
-//! Goal: prove the workbench's renderer engine (Monaco) runs in the OS-native
-//! webview (WebView2 / WKWebView / WebKitGTK) instead of Electron's bundled
-//! Chromium, and that local assets can be served through the same
-//! `vscode-file://` scheme VS Code already emits from `FileAccess.asBrowserUri`.
+//! Phase 1: boot the workbench window.
+//! The Rust main process computes the workbench's `vscode-file://` URL (the
+//! analog of `windowImpl.ts` `loadURL`), opens one native-webview window at it,
+//! and serves every asset through the TDD'd `vscode-protocol-resolver` — with
+//! the same COOP/COEP/Cache-Control/Document-Policy headers
+//! `protocolMainService.ts` attaches.
 //!
-//! This replaces, for the spike's slice, what
-//! `protocolMainService.ts` + `BrowserWindow` do in the Electron main process.
+//! Expected Phase-1 behavior: the workbench HTML + scripts load and begin
+//! booting, then error on the first `ipcRenderer` call. Wiring that IPC
+//! transport is Phase 2; this phase proves the document and asset graph load
+//! in the native webview outside Electron.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tauri::http::{Response, StatusCode};
-use vscode_protocol_resolver::{ResourceResolver, Resolution};
+use tauri::{WebviewUrl, WebviewWindowBuilder};
+use vscode_protocol_resolver::{workbench_url, ResourceResolver, Resolution};
 
-/// Build the resolver with the same roots VS Code's ProtocolMainService trusts.
-/// In the real port these come from the environment service; for the spike we
-/// trust the app's own resource directory (where `ui/` and Monaco are bundled).
-fn build_resolver() -> ResourceResolver {
-    let mut r = ResourceResolver::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            r.add_valid_root(dir);
-        }
+/// Where the built `vs/` bundle lives. Override with VSCODE_APP_ROOT; otherwise
+/// assume it sits next to the executable (as in a packaged app).
+fn app_root() -> PathBuf {
+    if let Ok(root) = std::env::var("VSCODE_APP_ROOT") {
+        return PathBuf::from(root);
     }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// `true` for a packaged build, `false` when running from sources (VSCODE_DEV).
+fn is_built() -> bool {
+    std::env::var("VSCODE_DEV").is_err()
+}
+
+fn build_resolver(root: &Path, built: bool) -> ResourceResolver {
+    // ProtocolMainService trusts appRoot, extensionsPath and storage homes.
+    // Phase 1 trusts the app root; later phases add the others.
+    let mut r = ResourceResolver::new()
+        .with_built(built)
+        // The workbench requires cross-origin isolation for SharedArrayBuffer.
+        .with_cross_origin_isolated(true);
+    r.add_valid_root(root);
     r
 }
 
 fn main() {
-    let resolver = build_resolver();
+    let root = app_root();
+    let built = is_built();
+    let url = workbench_url(&root, built);
+    let resolver = build_resolver(&root, built);
 
     tauri::Builder::default()
         // The Tauri analog of `defaultSession.protocol.registerFileProtocol`.
-        // Every `vscode-file://` request the renderer makes routes through the
-        // exact same security decision we unit-tested in protocol-resolver.
         .register_uri_scheme_protocol("vscode-file", move |_ctx, request| {
             match resolver.resolve(&request.uri().to_string()) {
-                Resolution::Allow { path, mime } => serve_file(path, mime),
+                Resolution::Allow { path, mime, headers } => serve_file(path, mime, headers),
                 Resolution::Block => Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .body(Vec::new())
                     .unwrap(),
             }
         })
+        .setup(move |app| {
+            // The analog of windowImpl's BrowserWindow + loadURL.
+            let target = url::Url::parse(&url)?;
+            WebviewWindowBuilder::new(app, "workbench", WebviewUrl::CustomProtocol(target))
+                .title("VS Code on Tauri — workbench")
+                .inner_size(1400.0, 900.0)
+                .build()?;
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
-fn serve_file(path: PathBuf, mime: String) -> Response<Vec<u8>> {
+fn serve_file(path: PathBuf, mime: String, headers: Vec<(String, String)>) -> Response<Vec<u8>> {
     match std::fs::read(&path) {
-        Ok(bytes) => Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", mime)
-            .body(bytes)
-            .unwrap(),
+        Ok(bytes) => {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", mime);
+            for (k, v) in headers {
+                builder = builder.header(k, v);
+            }
+            builder.body(bytes).unwrap()
+        }
         Err(_) => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Vec::new())

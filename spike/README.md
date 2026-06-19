@@ -7,8 +7,8 @@ Two crates:
 
 | Crate | What | Runs headless? |
 |---|---|---|
-| [`protocol-resolver`](protocol-resolver) | Pure-Rust port of VS Code's `vscode-file://` handler (`protocolMainService.ts`) with the same security rules. TDD'd. | ✅ `cargo test` |
-| [`tauri-monaco`](tauri-monaco) | Tauri shell that opens a window, hosts **Monaco** in the OS-native webview, and serves assets through the resolver. | ❌ needs webkit + a display |
+| [`protocol-resolver`](protocol-resolver) | Pure-Rust port of VS Code's `vscode-file://` handler (`protocolMainService.ts`): security rules **and** the COOP/COEP/Cache-Control/Document-Policy headers, plus `asBrowserUri`/`workbench_url` (`network.ts` + `windowImpl.ts`). TDD'd, 18 tests. | ✅ `cargo test` |
+| [`tauri-monaco`](tauri-monaco) | Tauri shell. Phase 1: opens a window at the workbench's `vscode-file://` URL and serves assets through the resolver. (`ui/index.html` keeps a standalone Monaco smoke test.) | ❌ needs webkit + a display |
 
 ## Run the tested logic (works anywhere)
 
@@ -26,15 +26,20 @@ Requires Rust, the Tauri CLI, and on Linux `libwebkit2gtk-4.1-dev` + `libgtk-3-d
 
 ```bash
 cargo install tauri-cli --version '^2'
-cd spike/tauri-monaco
-cargo tauri dev
+
+# Phase 1 — boot the real workbench. Point at a built VS Code `out/` dir:
+npm run compile           # in the repo root, produces ./out
+VSCODE_APP_ROOT="$PWD/out" cargo tauri dev --manifest-path spike/tauri-monaco/Cargo.toml
 ```
 
-Expected: a window titled "VS Code on Tauri — Monaco spike" with a working
-Monaco editor (syntax highlighting, dark theme) and a status bar showing the
-native webview's user agent plus the `vscode-file://` protocol result — proving
-the editor core runs outside Electron and the Rust protocol handler serves
-local assets.
+Expected (Phase 1): a window titled "VS Code on Tauri — workbench" that loads
+`workbench.html` and its script graph through the Rust `vscode-file://` handler
+(with COOP/COEP so `SharedArrayBuffer` is available), then errors on the first
+`ipcRenderer` call — that IPC transport is Phase 2. This proves the document and
+asset graph load in the native webview outside Electron.
+
+To instead run the standalone Monaco smoke test (`ui/index.html`), set the window
+URL back to the bundled frontend — useful when you don't have a built `out/`.
 
 > This spike could not be GUI-run in the authoring container: no
 > `webkit2gtk-4.1`/GTK dev libraries, no display, and apt mirrors were
