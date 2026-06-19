@@ -1,0 +1,17 @@
+[package]
+name = "vscode-protocol-resolver"
+version = "0.0.1"
+edition = "2021"
+description = "Rust port of VS Code's vscode-file:// protocol handler (ProtocolMainService) for the Tauri spike. Pure logic, no GUI/webkit dependency, so it is unit-testable headlessly."
+
+[lib]
+path = "src/lib.rs"
+
+# YAGNI + 'use an equivalent rust crate directly':
+# - `url`             : faithful URL/URI parsing (the analog of VS Code's URI.parse)
+# - `percent-encoding`: decode %20 etc. in resource paths
+# - `mime_guess`      : Content-Type by extension (Electron set this automatically)
+[dependencies]
+url = "2"
+percent-encoding = "2"
+mime_guess = "2"

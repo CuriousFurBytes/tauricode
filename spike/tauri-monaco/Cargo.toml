@@ -1,0 +1,17 @@
+[package]
+name = "tauri-monaco-spike"
+version = "0.0.1"
+edition = "2021"
+description = "Tauri shell that hosts the Monaco editor in the OS-native webview, serving assets through a Rust port of VS Code's vscode-file:// protocol. Proves the renderer can run outside Electron's bundled Chromium."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+# The TDD-tested security/asset logic lives in its own crate so it stays
+# headlessly testable (no webkit). Here we just wire it into the webview.
+vscode-protocol-resolver = { path = "../protocol-resolver" }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

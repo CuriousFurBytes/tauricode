@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VS Code on Tauri — Monaco spike</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #1e1e1e; color: #ccc;
+                 font-family: system-ui, sans-serif; }
+    #bar { padding: 6px 10px; font-size: 12px; border-bottom: 1px solid #333; }
+    #editor { height: calc(100% - 60px); }
+    .ok { color: #89d185; } .bad { color: #f48771; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    Renderer: <span id="ua"></span> &nbsp;|&nbsp;
+    Monaco: <span id="monaco-status">loading…</span> &nbsp;|&nbsp;
+    vscode-file:// protocol: <span id="proto-status">testing…</span>
+  </div>
+  <div id="editor"></div>
+
+  <!--
+    The spike loads Monaco from a CDN purely to prove the OS-native webview
+    can render it. In the real port this <script> would be served through the
+    vscode-file:// scheme, exactly as VS Code's workbench.html already does via
+    FileAccess.asBrowserUri('vs/loader.js').
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
+  <script>
+    document.getElementById('ua').textContent = navigator.userAgent;
+
+    // Proof #2: the custom protocol + Rust resolver actually serve a local file.
+    // The resolver blocks anything outside the trusted app root, mirroring
+    // protocolMainService.ts. (A 403 here would mean the security check fired.)
+    fetch('vscode-file://vscode-app/' + 'index.html')
+      .then(r => {
+        const el = document.getElementById('proto-status');
+        el.textContent = r.ok ? 'served (HTTP ' + r.status + ')' : 'blocked (HTTP ' + r.status + ')';
+        el.className = r.ok ? 'ok' : 'bad';
+      })
+      .catch(e => {
+        const el = document.getElementById('proto-status');
+        el.textContent = 'error: ' + e; el.className = 'bad';
+      });
+
+    // Proof #1: Monaco renders in the system webview.
+    require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs' } });
+    require(['vs/editor/editor.main'], function () {
+      monaco.editor.create(document.getElementById('editor'), {
+        value: [
+          '// If you can read this with syntax highlighting,',
+          '// the VS Code editor core runs outside Electron.',
+          'function port(from /*electron*/, to /*tauri*/) {',
+          '  return keepCompatibility(plugins, themes, config);',
+          '}'
+        ].join('\n'),
+        language: 'javascript',
+        theme: 'vs-dark',
+        automaticLayout: true
+      });
+      const el = document.getElementById('monaco-status');
+      el.textContent = 'rendered'; el.className = 'ok';
+    }, function (err) {
+      const el = document.getElementById('monaco-status');
+      el.textContent = 'failed: ' + err; el.className = 'bad';
+    });
+  </script>
+</body>
+</html>
